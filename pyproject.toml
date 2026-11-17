@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "talent-sourcing-mcp"
+version = "0.1.0"
+description = "MCP server for sourcing and verifying talent from public, ToS-compliant data sources"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Denis Akushode" }]
+dependencies = [
+    "mcp>=2.0",
+    "httpx>=0.27",
+    "uvicorn>=0.30",
+    "starlette>=0.37",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21"]
+
+[project.scripts]
+talent-sourcing-mcp = "talent_sourcing_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/talent_sourcing_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]

@@ -460,8 +460,14 @@ def _http_app(host: str, token: str | None):
     if token:
         class BearerAuth(BaseHTTPMiddleware):
             async def dispatch(self, request, call_next):
-                supplied = request.headers.get("authorization", "")
-                if not secrets.compare_digest(supplied, f"Bearer {token}"):
+                # Accept the token as a bearer header, or as ?key=... in the URL for
+                # clients (like some connector dialogs) that can't set headers.
+                header = request.headers.get("authorization", "")
+                query = request.query_params.get("key", "")
+                ok = secrets.compare_digest(header, f"Bearer {token}") or (
+                    bool(query) and secrets.compare_digest(query, token)
+                )
+                if not ok:
                     return JSONResponse({"error": "unauthorized"}, status_code=401)
                 return await call_next(request)
 

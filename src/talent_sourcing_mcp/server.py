@@ -21,7 +21,10 @@ from pydantic import Field
 from . import __version__
 from .config import Settings
 from .providers import (
+    REGIONS,
     GitHubClient,
+    region_matches,
+    resolve_region,
     HunterClient,
     PeopleDataLabsClient,
     ProviderError,
@@ -35,6 +38,10 @@ log = logging.getLogger("talent_sourcing_mcp")
 INSTRUCTIONS = """\
 Finds and verifies candidates from public, terms-compliant sources: GitHub, Stack Overflow,
 People Data Labs (any role, needs a key) and Hunter (email find/verify, needs a key).
+
+Locations can be a city, a country, or a whole region: Europe, EU, LATAM, Africa,
+North America or US (see list_regions). Regions are expanded to their countries and
+biggest tech hubs automatically.
 
 Typical flow: list_sources -> find_verified_talent (or a single-source search) ->
 verify_candidate on promising people -> shortlist_add -> shortlist_export.
@@ -73,6 +80,56 @@ def _fail(exc: Exception) -> None:
     raise ToolError(str(exc)) from exc
 
 
+LOCATION_HELP = "City, country, or region: 'Lagos', 'Germany', 'Europe', 'EU', 'LATAM', 'Africa', 'North America', 'US'"
+
+
+async def _github_search(
+    s: Settings, keywords: str | None, location: str | None, language: str | None,
+    min_followers: int | None, min_repos: int | None, limit: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Search GitHub; a region is searched across its biggest tech hubs and merged."""
+    client = GitHubClient(s)
+    region = resolve_region(location)
+    if not region:
+        q = client.build_query(keywords, location, language, min_followers, min_repos)
+        return await client.search(q, limit), [q]
+    hubs = REGIONS[region]["github_hubs"]
+    per_hub = max(1, -(-limit // len(hubs)))  # ceiling division
+    queries = [client.build_query(keywords, hub, language, min_followers, min_repos) for hub in hubs]
+    results = await asyncio.gather(*(client.search(q, per_hub) for q in queries), return_exceptions=True)
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    errors = [r for r in results if isinstance(r, Exception)]
+    # Interleave hubs so the top of the list covers the whole region.
+    lists = [r for r in results if not isinstance(r, Exception)]
+    for i in range(per_hub):
+        for lst in lists:
+            if i < len(lst) and lst[i]["id"] not in seen:
+                seen.add(lst[i]["id"])
+                found.append(lst[i])
+    if not found and errors:
+        raise errors[0]
+    return found[:limit], queries
+
+
+def _fit(c: dict[str, Any], req: dict[str, Any]) -> dict[str, Any]:
+    """score_fit, with region-aware location matching."""
+    region = resolve_region(req.get("location"))
+    if not region:
+        return score_fit(c, req)
+    fit = score_fit(c, {**req, "location": None})
+    label = region.upper() if len(region) <= 5 else region.title()
+    if region_matches(c.get("location"), region):
+        fit["location"] = f"Located in {c.get('location')} ({label})."
+    elif c.get("location"):
+        fit["score"] -= 20
+        fit["location"] = f"Located in {c.get('location')}, outside {label}."
+    else:
+        fit["score"] -= 10
+        fit["location"] = "Location unknown."
+    return fit
+
+
 # --------------------------------------------------------------------- sources
 
 
@@ -89,7 +146,7 @@ async def list_sources() -> dict[str, Any]:
 @mcp.tool(annotations=READ)
 async def search_github_talent(
     keywords: Annotated[str | None, Field(description="Words in bio/name, e.g. 'backend fintech'")] = None,
-    location: Annotated[str | None, Field(description="e.g. 'Lagos' or 'Nigeria'")] = None,
+    location: Annotated[str | None, Field(description=LOCATION_HELP)] = None,
     language: Annotated[str | None, Field(description="Main programming language, e.g. 'Python'")] = None,
     min_followers: Annotated[int | None, Field(ge=0)] = None,
     min_repos: Annotated[int | None, Field(ge=0)] = None,
@@ -98,12 +155,12 @@ async def search_github_talent(
     """Find software engineers on GitHub by location, language and activity."""
     if not any([keywords, location, language]):
         raise ToolError("Give at least one of keywords, location or language.")
-    client = GitHubClient(_settings())
-    q = client.build_query(keywords, location, language, min_followers, min_repos)
     try:
-        found = await client.search(q, limit)
+        found, queries = await _github_search(_settings(), keywords, location, language,
+                                              min_followers, min_repos, limit)
     except ProviderError as exc:
         _fail(exc)
+    q = queries[0] if len(queries) == 1 else queries
     store = _store()
     results = [_public(merge_profiles([c])) for c in found if not store.is_blocked(c)]
     return {"query": q, "count": len(results), "candidates": results}
@@ -112,7 +169,7 @@ async def search_github_talent(
 @mcp.tool(annotations=READ)
 async def search_stackoverflow_experts(
     tag: Annotated[str, Field(description="Stack Overflow tag, e.g. 'python', 'react', 'kubernetes'")],
-    location: Annotated[str | None, Field(description="Filter by text in the profile location")] = None,
+    location: Annotated[str | None, Field(description=LOCATION_HELP)] = None,
     min_reputation: Annotated[int, Field(ge=0)] = 0,
     limit: Annotated[int, Field(ge=1, le=50)] = 10,
 ) -> dict[str, Any]:
@@ -129,7 +186,7 @@ async def search_stackoverflow_experts(
 @mcp.tool(annotations=READ)
 async def search_people(
     job_title: Annotated[str | None, Field(description="e.g. 'talent acquisition', 'accountant'")] = None,
-    location_country: Annotated[str | None, Field(description="e.g. 'nigeria'")] = None,
+    location_country: Annotated[str | None, Field(description="Country or region, e.g. 'nigeria', 'europe', 'latam'")] = None,
     location_locality: Annotated[str | None, Field(description="City, e.g. 'lagos'")] = None,
     skills: Annotated[list[str] | None, Field(description="Every skill listed must be present")] = None,
     min_years_experience: Annotated[int | None, Field(ge=0)] = None,
@@ -308,14 +365,14 @@ async def score_candidate_fit(
     min_years_experience: int | None = None,
 ) -> dict[str, Any]:
     """Score how well a candidate fits a role (0-100): skills 60, location 20, experience 20."""
-    return score_fit(candidate, {"skills": skills, "location": location,
+    return _fit(candidate, {"skills": skills, "location": location,
                                  "min_years_experience": min_years_experience})
 
 
 @mcp.tool(annotations=READ)
 async def find_verified_talent(
     skills: Annotated[list[str], Field(description="Must-have skills, e.g. ['python', 'django']")],
-    location: Annotated[str | None, Field(description="City or country, e.g. 'Lagos' or 'Nigeria'")] = None,
+    location: Annotated[str | None, Field(description=LOCATION_HELP)] = None,
     job_title: Annotated[str | None, Field(description="Used for People Data Labs search")] = None,
     min_years_experience: int | None = None,
     github_language: Annotated[str | None, Field(description="Defaults to the first skill")] = None,
@@ -335,8 +392,10 @@ async def find_verified_talent(
     first_skill = skills[0] if skills else None
     tasks: dict[str, Any] = {}
     if "github" in wanted and (github_language or first_skill or location):
-        gh = GitHubClient(s)
-        tasks["github"] = gh.search(gh.build_query(None, location, github_language or first_skill), limit)
+        async def gh_task():
+            return (await _github_search(s, None, location, github_language or first_skill,
+                                         None, None, limit))[0]
+        tasks["github"] = gh_task()
     if "stackoverflow" in wanted and (stackoverflow_tag or first_skill):
         tag = (stackoverflow_tag or first_skill).lower().replace(" ", "-")
         tasks["stackoverflow"] = StackExchangeClient(s).top_answerers(tag, location, 0, limit)
@@ -361,7 +420,7 @@ async def find_verified_talent(
 
     req = {"skills": skills, "location": location, "min_years_experience": min_years_experience}
     candidates = [merge_profiles([c]) for c in found if not store.is_blocked(c)]
-    candidates.sort(key=lambda c: -score_fit(c, req)["score"])
+    candidates.sort(key=lambda c: -_fit(c, req)["score"])
 
     verified: list[dict[str, Any]] = []
     for i, c in enumerate(candidates):
@@ -378,7 +437,7 @@ async def find_verified_talent(
                 errors.extend(n for n in notes if n not in errors)
             except ToolError as exc:
                 errors.append(str(exc))
-        fit = score_fit(c, req)
+        fit = _fit(c, req)
         c["fit"] = fit
         if c["verification"]["score"] >= min_verification_score:
             verified.append(c)
@@ -390,6 +449,16 @@ async def find_verified_talent(
         "candidates": [_public(c) for c in verified[:limit]],
         "warnings": errors,
         "ranking": "60% fit + 40% verification",
+    }
+
+
+@mcp.tool(annotations=READ)
+async def list_regions() -> dict[str, Any]:
+    """Show the regions you can search by name, with the countries and GitHub hubs each covers."""
+    return {
+        name: {"countries": len(r["countries"]), "github_hubs": r["github_hubs"],
+               "sample_countries": r["countries"][:8]}
+        for name, r in REGIONS.items()
     }
 
 

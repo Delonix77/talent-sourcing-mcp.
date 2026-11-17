@@ -31,13 +31,124 @@ class ProviderError(RuntimeError):
     """A data source failed or is not configured. The message is safe to show the user."""
 
 
+# ------------------------------------------------------------------------ regions
+# People rarely write "Europe" or "LATAM" in a profile, so a region is expanded into
+# the countries it covers (for People Data Labs and location matching) and into the
+# biggest tech hubs (for GitHub, whose location search matches one place at a time).
+
+_EU = [
+    "austria", "belgium", "bulgaria", "croatia", "cyprus", "czech republic", "czechia",
+    "denmark", "estonia", "finland", "france", "germany", "greece", "hungary", "ireland",
+    "italy", "latvia", "lithuania", "luxembourg", "malta", "netherlands", "poland",
+    "portugal", "romania", "slovakia", "slovenia", "spain", "sweden",
+]
+_EUROPE = _EU + [
+    "albania", "andorra", "belarus", "bosnia and herzegovina", "iceland", "kosovo",
+    "liechtenstein", "moldova", "monaco", "montenegro", "north macedonia", "norway",
+    "san marino", "serbia", "switzerland", "ukraine", "united kingdom",
+]
+_LATAM = [
+    "argentina", "bolivia", "brazil", "chile", "colombia", "costa rica", "cuba",
+    "dominican republic", "ecuador", "el salvador", "guatemala", "honduras", "mexico",
+    "nicaragua", "panama", "paraguay", "peru", "puerto rico", "uruguay", "venezuela",
+]
+_AFRICA = [
+    "algeria", "angola", "benin", "botswana", "burkina faso", "burundi", "cameroon",
+    "cape verde", "central african republic", "chad", "comoros", "djibouti", "egypt",
+    "democratic republic of the congo", "republic of the congo", "equatorial guinea",
+    "eritrea", "eswatini", "ethiopia", "gabon", "gambia", "ghana", "guinea",
+    "guinea-bissau", "ivory coast", "côte d'ivoire", "kenya", "lesotho", "liberia",
+    "libya", "madagascar", "malawi", "mali", "mauritania", "mauritius", "morocco",
+    "mozambique", "namibia", "niger", "nigeria", "rwanda", "sao tome and principe",
+    "senegal", "seychelles", "sierra leone", "somalia", "south africa", "south sudan",
+    "sudan", "tanzania", "togo", "tunisia", "uganda", "zambia", "zimbabwe",
+]
+_US_HUBS = ["San Francisco", "New York", "Seattle", "Austin", "Boston", "Los Angeles", "Chicago"]
+_US_ALIASES = ["usa", "united states", "us", "america", "california", "texas", "new york",
+               "washington", "massachusetts", "illinois", "florida", "georgia", "colorado",
+               "ca", "ny", "tx", "wa", "ma", "il", "fl"]
+
+REGIONS: dict[str, dict[str, list[str]]] = {
+    "europe": {
+        "countries": _EUROPE,
+        "github_hubs": ["Berlin", "London", "Amsterdam", "Warsaw", "Lisbon", "Madrid",
+                        "Paris", "Kyiv", "Bucharest", "Stockholm"],
+        "aliases": ["uk", "england", "scotland", "wales", "deutschland", "london", "berlin",
+                    "amsterdam", "paris", "madrid", "lisbon", "warsaw", "munich", "dublin"],
+    },
+    "eu": {
+        "countries": _EU,
+        "github_hubs": ["Berlin", "Amsterdam", "Warsaw", "Lisbon", "Madrid", "Paris",
+                        "Munich", "Bucharest", "Stockholm", "Prague"],
+        "aliases": ["deutschland", "berlin", "amsterdam", "paris", "madrid", "lisbon",
+                    "warsaw", "munich", "dublin", "prague"],
+    },
+    "latam": {
+        "countries": _LATAM,
+        "github_hubs": ["Brazil", "Mexico", "Argentina", "Colombia", "Chile", "Peru", "Uruguay"],
+        "aliases": ["brasil", "méxico", "são paulo", "sao paulo", "buenos aires", "bogotá",
+                    "bogota", "santiago", "lima", "montevideo", "cdmx"],
+    },
+    "africa": {
+        "countries": _AFRICA,
+        "github_hubs": ["Nigeria", "Kenya", "South Africa", "Egypt", "Ghana", "Morocco", "Rwanda"],
+        "aliases": ["lagos", "abuja", "nairobi", "cape town", "johannesburg", "cairo",
+                    "accra", "kigali", "casablanca"],
+    },
+    "north america": {
+        "countries": ["united states", "canada"],
+        "github_hubs": _US_HUBS + ["Toronto", "Vancouver"],
+        "aliases": _US_ALIASES + ["toronto", "vancouver", "montreal", "ontario", "canada"],
+    },
+    "us": {
+        "countries": ["united states"],
+        "github_hubs": _US_HUBS,
+        "aliases": _US_ALIASES,
+    },
+}
+_REGION_NAMES = {
+    "europe": "europe", "european": "europe",
+    "eu": "eu", "european union": "eu",
+    "latam": "latam", "latin america": "latam", "south america": "latam",
+    "central america": "latam",
+    "africa": "africa", "african": "africa",
+    "north america": "north america", "na": "north america",
+    "us": "us", "usa": "us", "united states": "us", "united states of america": "us",
+    "america": "us",
+}
+
+
+def resolve_region(location: str | None) -> str | None:
+    """Return the region key if `location` names a region (e.g. 'Europe', 'LATAM')."""
+    if not location:
+        return None
+    return _REGION_NAMES.get(location.strip().lower().rstrip("."))
+
+
+def region_matches(candidate_location: str | None, region: str) -> bool:
+    """True if a free-text location (e.g. 'Berlin, Germany') falls inside the region."""
+    if not candidate_location:
+        return False
+    text = " " + " ".join(candidate_location.lower().replace(",", " ").split()) + " "
+    r = REGIONS[region]
+    for term in r["countries"] + [h.lower() for h in r["github_hubs"]] + r["aliases"]:
+        if f" {term} " in text:
+            return True
+    return False
+
+
 def _days_since(iso_or_epoch: str | int | float | None) -> int | None:
     if iso_or_epoch in (None, ""):
         return None
     if isinstance(iso_or_epoch, (int, float)):
         dt = datetime.fromtimestamp(iso_or_epoch, tz=timezone.utc)
     else:
-        dt = datetime.fromisoformat(str(iso_or_epoch).replace("Z", "+00:00"))
+        text = str(iso_or_epoch).replace("Z", "+00:00")
+        if len(text) == 7:  # "YYYY-MM"
+            text += "-01"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
     return max(0, (datetime.now(timezone.utc) - dt).days)
 
 
@@ -135,15 +246,20 @@ class GitHubClient(BaseClient):
         logins = [item["login"] for item in data.get("items", [])][:limit]
         sem = asyncio.Semaphore(5)
 
+        errors: list[ProviderError] = []
+
         async def one(login: str) -> dict[str, Any] | None:
             async with sem:
                 try:
                     return await self.profile(login)
-                except ProviderError:
+                except ProviderError as exc:
+                    errors.append(exc)
                     return None
 
-        results = await asyncio.gather(*(one(l) for l in logins))
-        return [r for r in results if r]
+        results = [r for r in await asyncio.gather(*(one(l) for l in logins)) if r]
+        if logins and not results and errors:
+            raise errors[0]  # every profile failed: report why instead of returning nothing
+        return results
 
     async def profile(self, login: str) -> dict[str, Any]:
         user = await self._get(f"{self.base}/users/{login}", headers=self._headers())
@@ -227,7 +343,10 @@ class StackExchangeClient(BaseClient):
             u["signals"]["tag_score"] = {tag: tag_scores.get(u["signals"]["stackoverflow_user_id"], 0)}
             if u["signals"]["reputation"] < min_reputation:
                 continue
-            if location and location.lower() not in (u.get("location") or "").lower():
+            region = resolve_region(location)
+            if region and not region_matches(u.get("location"), region):
+                continue
+            if location and not region and location.lower() not in (u.get("location") or "").lower():
                 continue
             out.append(u)
         out.sort(key=lambda c: -sum(c["signals"]["tag_score"].values()))
@@ -293,6 +412,14 @@ class PeopleDataLabsClient(BaseClient):
         must: list[dict[str, Any]] = []
         if job_title:
             must.append({"match": {"job_title": job_title}})
+        for loc in (location, location_country):
+            region = resolve_region(loc)
+            if region:
+                must.append({"terms": {"location_country": REGIONS[region]["countries"]}})
+                if loc == location:
+                    location = None
+                else:
+                    location_country = None
         if location:
             must.append({"match": {"location_name": {"query": location.lower(), "operator": "and"}}})
         if location_country:
@@ -332,6 +459,8 @@ class PeopleDataLabsClient(BaseClient):
 
     @staticmethod
     def normalize(p: dict[str, Any], likelihood: int | None = None) -> dict[str, Any]:
+        # On PDL's free plan some fields come back as True ("we have it") instead of a value.
+        p = {k: (None if isinstance(v, bool) else v) for k, v in p.items()}
         links: dict[str, str] = {}
         if p.get("linkedin_url"):
             links["linkedin"] = p["linkedin_url"] if p["linkedin_url"].startswith("http") else f"https://{p['linkedin_url']}"
@@ -340,6 +469,7 @@ class PeopleDataLabsClient(BaseClient):
         emails = []
         if isinstance(p.get("work_email"), str):
             emails.append(p["work_email"])
+        updated = p.get("job_last_updated") or p.get("job_last_verified")
         return {
             "id": f"peopledatalabs:{p.get('id')}",
             "source": "peopledatalabs",
@@ -354,7 +484,8 @@ class PeopleDataLabsClient(BaseClient):
             "signals": {
                 "years_experience": p.get("inferred_years_experience"),
                 "job_start_date": p.get("job_start_date"),
-                "profile_updated": p.get("job_last_updated") or p.get("job_last_verified"),
+                "profile_updated": updated,
+                "last_active_days": _days_since(updated) if updated else None,
                 "match_likelihood": likelihood,
             },
         }
